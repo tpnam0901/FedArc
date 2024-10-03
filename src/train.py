@@ -47,7 +47,6 @@ def train(
     global_val_epoch,
     mlflow_prefix,
     current_round,
-    feature_anchors,
 ):
     if mlflow_prefix:
         weight_best_path = os.path.join(
@@ -71,13 +70,6 @@ def train(
                 labels = labels.to(device)
 
                 outputs = model(inputs)
-                if "CosineSimilarityLoss" in cfg.loss_type:
-                    anchors = torch.stack([feature_anchors] * labels.size(0), dim=0)
-                    anchors = anchors[
-                        range(labels.size(0)), list(labels.detach().cpu().numpy()), :
-                    ]
-                    outputs = list(outputs)
-                    outputs.append(anchors)
                 loss = criterion(outputs, labels)
                 loss.backward()
 
@@ -170,23 +162,6 @@ def train(
             )
         # lr_scheduler.step()
 
-    # -------------------------------- Feature anchor ------------------------------------- #
-    feature_anchors = torch.zeros(cfg.num_classes, cfg.embedding_linear_out)
-    if "CosineSimilarityLoss" in cfg.loss_type:
-        dataset.train()
-        features = [
-            torch.zeros(0, cfg.embedding_linear_out) for _ in range(cfg.num_classes)
-        ]
-        with torch.no_grad():
-            for inputs, labels in iter(dataloader_shuffle):
-                inputs = inputs.to(device)
-                outputs = model(inputs)
-                for cls_index, feat in zip(labels, outputs[1].detach().cpu()):
-                    cls_index = int(cls_index.item())
-                    features[cls_index] = torch.concat(
-                        [features[cls_index], feat.unsqueeze(0)], dim=0
-                    )
-            feature_anchors = torch.stack([feat.mean(0) for feat in features], dim=0)
 
     model.to("cpu")
     if cfg.client_best_weight and cfg.client_do_evaluation:
@@ -197,7 +172,6 @@ def train(
         global_val_epoch,
         best_acc,
         model.state_dict(),
-        feature_anchors,
     )
 
 
@@ -340,7 +314,6 @@ def main(cfg: Config, resume: bool):
     # -------------------------- Federated training -------------------------- #
     model.to("cpu")
     global_state_dict = model.state_dict()
-    global_feature_anchors = torch.zeros(cfg.num_classes, 0, cfg.embedding_linear_out)
     global_best_acc = -1.0
     global_val_step = 0
 
@@ -395,7 +368,7 @@ def main(cfg: Config, resume: bool):
                 if resume:
                     raise NotImplementedError
 
-                train_step, val_step, best_acc, state_dict, local_feature_anchor = (
+                train_step, val_step, best_acc, state_dict = (
                     train(
                         cfg=cfg,
                         logger=logger,
@@ -415,20 +388,12 @@ def main(cfg: Config, resume: bool):
                         global_val_epoch=global_val_epochs[client_id],
                         mlflow_prefix=client_id,
                         current_round=current_round,
-                        feature_anchors=global_feature_anchors,
                     )
                 )
                 local_state_dicts[client_id] = state_dict
                 global_train_epochs[client_id] += train_step
                 global_val_epochs[client_id] += val_step
                 local_best_acc[client_id] = best_acc
-                global_feature_anchors = torch.concat(
-                    [
-                        global_feature_anchors,
-                        local_feature_anchor.unsqueeze(1),
-                    ],
-                    dim=1,
-                )
 
             client_weights = [1] * cfg.num_clients
             new_client_weights = []
@@ -443,7 +408,6 @@ def main(cfg: Config, resume: bool):
             global_state_dict = getattr(aggregation, cfg.aggregate_type)(
                 global_state_dict, local_state_dicts, client_weights
             )
-            global_feature_anchors = global_feature_anchors.mean(1).unsqueeze(1)
             model.to("cpu")
             model.load_state_dict(global_state_dict)
             model.to(device)
